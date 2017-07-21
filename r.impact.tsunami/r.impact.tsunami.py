@@ -29,7 +29,7 @@
 #% key: lake
 #% type: string
 #% gisprompt: old,cell,raster
-#% description: Name of lake depth map
+#% description: Name of lake depth map, with NULL values out of the lake
 #% required : yes
 #%end
 #%option
@@ -222,6 +222,8 @@ def main():
     tm["wave_elev"] = "wave_elev_"+ processid
     tm["elev"] = "elev_"+ processid
     #tm["inond"] = "inond_"+ processid
+    tm["cell"] = "cell_"+ processid
+    tm["cell_processed"] = "cell_processed"+ processid
     
     #check temporary map names are not existing maps
     for key, value in tm.items():
@@ -233,7 +235,7 @@ def main():
     #============================================================================================
     if not flags["g"]:
         grass.message("step 0")
-    i_hw = grass.read_command("r.what", flags="f",input=lake,east_north=[(east,north)]).split("|")[-2]
+    i_hw = grass.read_command("r.what", flags="f",map=lake,coordinates=[(east,north)]).split("|")[-2]
     if i_hw=="*":
         grass.fatal(_("Coordinates <%s,%s> are not on the lake.") %(east,north))
     else:
@@ -331,15 +333,15 @@ def main():
     if not flags["g"]:
         grass.message("step 5")
 
-    #claculate runup zones: 
+    #calculate runup zones: 
     #   - 1 = wave propagation zone
-    #   - 100 = runup propagation zoone
+    #   - 100 = runup propagation zone
     #   - 10000 = coast terrain
     #   - 0 = wave generation (near field)
     #   N.B.: wbc = H/h, wave break condition
     #wbc = 0.8 --> following Coast Engineering Manual
     #wbc = 0.521 -- follwoing equations limits
-    grass.mapcalc("$zones = if(isnull($lake),10000,if($field==0,0,if($H/$lake>$wbc,100,1)))", 
+    grass.mapcalc("$zones = if( isnull($lake), 10000, if($field==0, 0, if($H/$lake>$wbc, 100, 1)))", 
                 zones=tm["zones"],lake=lake,H=tm["H"],field=tm["field"], wbc=wbc, quiet=quiet)
 
     #calculate runup line (2=runup line, 1=coast line affected by runup, 3=coast line not affected by runup)
@@ -367,12 +369,53 @@ def main():
     
     tm["outA"] = outI+"A_"+ processid
     tm["outB"] = outI+"B_"+ processid
-    grass.run_command("r.surf.idw", input=tm["wave_elev"], output=tm["outA"], npoints=1, quiet=quiet)
+
+        #due to non-support of floating raster for grass7 version of r.surf.idw, we need to do pre- and post- conversion of CELL type to DCELL type
+    info_wave_elev = grass.parse_command('r.info', map=tm["wave_elev"], flags='r') # get min and max info
+
+    minimal=float(info_wave_elev['min'])
+    maximal=float(info_wave_elev['max'])
     
+    minimal_decimals = str(minimal)[::-1].find('.') # get number of decimals
+    maximal_decimals = str(maximal)[::-1].find('.') # get number of decimals
+    
+    decimals = max(minimal_decimals, maximal_decimals)
+ 
+    newminimal = int(10**decimals * minimal) # min value for float to integer conversion
+    newmaximal = int(10**decimals * maximal) # max value for float to integer conversion
+   
+    rule = str(minimal) + ":" + str(maximal) + ":" + str(newminimal) + ":" + str(newmaximal)
+    rule_invert = str(newminimal) + ":" + str(newmaximal) + ":" + str(minimal) + ":" + str(maximal)
+
+    print "number of decimals for float to integer conversion : ",decimals
+    print "rule for float to integer conversion : ",rule
+    print "rule for integer to float conversion : ",rule_invert
+
+    grass.write_command("r.recode", input=tm["wave_elev"], output='tmp2', rules='-', stdin=rule, overwrite=True)
+    grass.run_command("r.surf.idw", input='tmp2', output='tmp3', npoints=1, quiet=True, overwrite = True)
+    grass.write_command("r.recode", flags="d", input='tmp3', output=tm["outA"], rules='-', stdin=rule_invert, overwrite=True)
+
+    #info1 = grass.parse_command('r.info', map=tm["wave_elev"], flags='r')
+    #info2 = grass.parse_command('r.info', map='tmp2', flags='r')
+    #info3 = grass.parse_command('r.info', map='tmp3', flags='r')
+    #info4 = grass.parse_command('r.info', map=tm["outA"], flags='r')
+    #info2_c = grass.parse_command('r.info', map='tmp2', flags='g')
+    #info3_c = grass.parse_command('r.info', map='tmp3', flags='g')
+    #info1_c = grass.parse_command('r.info', map=tm["wave_elev"], flags='g')
+    #info4_c = grass.parse_command('r.info', map=tm["outA"], flags='g')
+
+    #print "info1", info1,info1_c
+    #print "info2",info2,info2_c
+    #print "info3",info3,info3_c
+    #print "info4",info4,info4_c
+    
+    grass.run_command("g.remove", flags="f", type="raster", name="tmp2,tmp3,tmp4", quiet=True)
+
     #calculate inundation in m
     grass.mapcalc("$inondB = if($zones==10000 && $elev<$inondA/100.0, ($inondA/100.0)-$elev,null())",
                     inondB=tm["outB"],inondA=tm["outA"],elev=tm["elev"],zones=tm["zones"],overwrite=True, quiet=quiet)
-    grass.run_command("r.neighbors", input=tm["outB"], output=outI, selection=tm["outB"], overwrite=True, quiet=quiet)
+    grass.run_command("r.neighbors", input=tm["outB"], output=outI, selection=tm["outB"], overwrite=True)
+    #grass.run_command("r.neighbors", input=tm["outB"], output=outI, selection=tm["outB"], overwrite=True, quiet=quiet)
 
     #mask output inundation
     if options['shadow'] is not '':
@@ -512,18 +555,19 @@ def main():
         """
     
     if not flags["t"]:
-        grass.run_command("g.remove", rast=",".join([tm[m] for m in tm.keys()]), quiet=True)
+        grass.run_command("g.remove", flags="f", type="raster", name=",".join([tm[m] for m in tm.keys()]), quiet=True)
+        grass.run_command("g.remove", type="raster", name=",".join([tm[m] for m in tm.keys()]), quiet=True)
     t = False
     
 def cleanup():
     if t:
-        grass.run_command("g.remove", flags="f", rast=",".join([tm[m] for m in tm.keys()]), quiet=True)
+        grass.run_command("g.remove", flags="f", type="raster", name=",".join([tm[m] for m in tm.keys()]), quiet=True)
+        grass.run_command("g.remove", type="raster", name=",".join([tm[m] for m in tm.keys()]), quiet=True)
 
 if __name__ == "__main__":
     options, flags = grass.parser()
     atexit.register(cleanup)
     main()
-
 
 
 
